@@ -51,25 +51,55 @@ async function mediaPart(m: Row) {
   return null
 }
 
-async function complete(cfg: Row, model: string, messages: unknown[], tools: unknown[]) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      const res = await fetch(`${cfg.endpoint.replace(/\/$/, '')}/chat/completions`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${cfg.api_key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, ...(tools.length ? { tools } : {}) }),
-      })
-      if (res.ok) {
-        const data = await res.json()
-        const choice = data.choices?.[0]?.message
-        if (choice) return choice
-      } else if (res.status !== 429 && res.status < 500) {
-        console.error('finn upstream', res.status, await res.text())
-        return null
+type Key = { id: string; label: string; endpoint: string; key: string }
+
+function keysOf(cfg: Row): Key[] {
+  const list: Key[] = (Array.isArray(cfg.api_keys) ? cfg.api_keys : []).filter((k: Row) => k?.key && k?.endpoint)
+  if (!list.length && cfg.api_key) list.push({ id: 'legacy', label: 'Key', endpoint: cfg.endpoint, key: cfg.api_key })
+  return list
+}
+
+function modelsOf(cfg: Row): string[] {
+  const list = Array.isArray(cfg.models) && cfg.models.length ? cfg.models : [cfg.model]
+  return list.filter(Boolean)
+}
+
+function modelFor(endpoint: string, model: string) {
+  if (/openrouter/i.test(endpoint) && !model.includes('/')) return `google/${model}`
+  if (/googleapis/i.test(endpoint) && model.startsWith('google/')) return model.slice('google/'.length)
+  return model
+}
+
+async function complete(cfg: Row, messages: unknown[], tools: unknown[]) {
+  const keys = keysOf(cfg)
+  const models = modelsOf(cfg)
+  for (let round = 0; round < 5; round++) {
+    let limited = false
+    for (const k of keys) {
+      for (const m of models) {
+        const model = modelFor(k.endpoint, m)
+        try {
+          const res = await fetch(`${k.endpoint.replace(/\/$/, '')}/chat/completions`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${k.key}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model, messages, ...(tools.length ? { tools } : {}) }),
+          })
+          if (res.ok) {
+            const data = await res.json()
+            const choice = data.choices?.[0]?.message
+            if (choice) return choice
+            continue
+          }
+          console.error('finn upstream', k.label, model, res.status, (await res.text()).slice(0, 300))
+          if (res.status === 401 || res.status === 403) break
+          if (res.status === 429) limited = true
+        } catch (e) {
+          console.error('finn fetch', k.label, model, e)
+          limited = true
+        }
       }
-    } catch (e) {
-      console.error('finn fetch', e)
     }
+    if (!limited) break
     await sleep(2000)
   }
   return null
@@ -111,7 +141,7 @@ Deno.serve(async (req) => {
 
   try {
     const [cfg] = await db`select * from private.finn_config where id = 1`
-    if (!cfg?.api_key) {
+    if (!cfg || !keysOf(cfg).length) {
       await reply(BUSY)
       return json({ ok: false })
     }
@@ -178,12 +208,10 @@ Deno.serve(async (req) => {
       )
     }
 
-    const hasAudio = JSON.stringify(convo).includes('"input_audio"')
-    const model = hasAudio ? cfg.audio_model : cfg.model
     const messages: Row[] = [{ role: 'system', content: system }, ...convo]
 
     for (let round = 0; round < 5; round++) {
-      const out = await complete(cfg, model, messages, tools)
+      const out = await complete(cfg, messages, tools)
       if (!out) {
         await reply(BUSY)
         return json({ ok: false })

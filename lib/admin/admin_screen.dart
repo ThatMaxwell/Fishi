@@ -271,6 +271,16 @@ class _NewsTabState extends State<_NewsTab> with AutomaticKeepAliveClientMixin {
   }
 }
 
+const _googleEndpoint = 'https://generativelanguage.googleapis.com/v1beta/openai';
+const _openRouterEndpoint = 'https://openrouter.ai/api/v1';
+const _defaultModels = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'];
+
+String _providerName(String endpoint) {
+  if (endpoint.contains('googleapis')) return 'Google AI';
+  if (endpoint.contains('openrouter')) return 'OpenRouter';
+  return Uri.tryParse(endpoint)?.host ?? endpoint;
+}
+
 class _FinnTab extends StatefulWidget {
   const _FinnTab();
 
@@ -279,13 +289,15 @@ class _FinnTab extends StatefulWidget {
 }
 
 class _FinnTabState extends State<_FinnTab> with AutomaticKeepAliveClientMixin {
-  final _key = TextEditingController();
-  final _endpoint = TextEditingController();
-  final _model = TextEditingController();
-  final _audio = TextEditingController();
   final _prompt = TextEditingController();
-  Map<String, dynamic>? _cfg;
-  bool _busy = false;
+  final _newModel = TextEditingController();
+  List<Map<String, dynamic>> _keys = [];
+  List<String> _models = [];
+  bool _loaded = false;
+  bool _failed = false;
+  bool _modelsDirty = false;
+  bool _savingModels = false;
+  bool _savingPrompt = false;
 
   @override
   bool get wantKeepAlive => true;
@@ -298,88 +310,427 @@ class _FinnTabState extends State<_FinnTab> with AutomaticKeepAliveClientMixin {
 
   @override
   void dispose() {
-    for (final c in [_key, _endpoint, _model, _audio, _prompt]) {
-      c.dispose();
-    }
+    _prompt.dispose();
+    _newModel.dispose();
     super.dispose();
   }
 
   Future<void> _load() async {
     try {
       final c = (await supa.rpc('admin_get_finn_config') as Map).cast<String, dynamic>();
-      _endpoint.text = c['endpoint'] as String? ?? '';
-      _model.text = c['model'] as String? ?? '';
-      _audio.text = c['audio_model'] as String? ?? '';
-      _prompt.text = c['system_prompt'] as String? ?? '';
-      if (mounted) setState(() => _cfg = c);
+      if (!mounted) return;
+      setState(() {
+        _keys = ((c['keys'] as List?) ?? const []).map((e) => (e as Map).cast<String, dynamic>()).toList();
+        _models = ((c['models'] as List?) ?? const []).cast<String>();
+        _prompt.text = c['system_prompt'] as String? ?? '';
+        _modelsDirty = false;
+        _loaded = true;
+        _failed = false;
+      });
     } catch (_) {
-      if (mounted) setState(() => _cfg = {});
+      if (mounted) setState(() => _failed = _loaded = true);
     }
   }
 
-  Future<void> _save() async {
-    setState(() => _busy = true);
+  Future<void> _editKey([Map<String, dynamic>? key]) async {
+    final saved = await Navigator.of(context).push<bool>(sheetRoute(_KeySheet(existing: key)));
+    if (saved == true) {
+      await _load();
+      if (mounted) showToast(context, tr('Finn updated'));
+    }
+  }
+
+  Future<void> _removeKey(Map<String, dynamic> key) async {
+    final ok = await confirm(context, title: tr('Remove {name}?', {'name': key['label']}), body: tr('Finn will stop using this key.'), action: tr('Remove'), danger: true);
+    if (!ok) return;
     try {
-      await supa.rpc('admin_set_finn_config', params: {
-        'new_api_key': _key.text.trim().isEmpty ? null : _key.text.trim(),
-        'new_endpoint': _endpoint.text.trim(),
-        'new_model': _model.text.trim(),
-        'new_audio_model': _audio.text.trim(),
-        'new_system_prompt': _prompt.text,
-      });
-      _key.clear();
+      await supa.rpc('admin_remove_finn_key', params: {'key_id': key['id']});
+      await _load();
+    } catch (_) {
+      if (mounted) showToast(context, tr('Could not save.'), error: true);
+    }
+  }
+
+  Future<void> _moveKey(int i, int dir) async {
+    final j = i + dir;
+    if (j < 0 || j >= _keys.length) return;
+    HapticFeedback.selectionClick();
+    setState(() {
+      final k = _keys.removeAt(i);
+      _keys.insert(j, k);
+    });
+    try {
+      await supa.rpc('admin_order_finn_keys', params: {'key_ids': _keys.map((k) => k['id']).toList()});
+    } catch (_) {
+      if (mounted) showToast(context, tr('Could not save.'), error: true);
+      await _load();
+    }
+  }
+
+  void _moveModel(int i, int dir) {
+    final j = i + dir;
+    if (j < 0 || j >= _models.length) return;
+    HapticFeedback.selectionClick();
+    setState(() {
+      final m = _models.removeAt(i);
+      _models.insert(j, m);
+      _modelsDirty = true;
+    });
+  }
+
+  void _addModel() {
+    final m = _newModel.text.trim();
+    if (m.isEmpty || _models.contains(m)) return;
+    HapticFeedback.selectionClick();
+    setState(() {
+      _models = [..._models, m];
+      _modelsDirty = true;
+    });
+    _newModel.clear();
+  }
+
+  Future<void> _saveModels() async {
+    if (_models.isEmpty) {
+      showToast(context, tr('Add at least one model.'), error: true);
+      return;
+    }
+    setState(() => _savingModels = true);
+    try {
+      await supa.rpc('admin_set_finn_models', params: {'new_models': _models});
       await _load();
       if (mounted) showToast(context, tr('Finn updated'));
     } catch (_) {
       if (mounted) showToast(context, tr('Could not save.'), error: true);
     }
-    if (mounted) setState(() => _busy = false);
+    if (mounted) setState(() => _savingModels = false);
+  }
+
+  Future<void> _savePrompt() async {
+    setState(() => _savingPrompt = true);
+    try {
+      await supa.rpc('admin_set_finn_config', params: {'new_system_prompt': _prompt.text});
+      if (mounted) showToast(context, tr('Finn updated'));
+    } catch (_) {
+      if (mounted) showToast(context, tr('Could not save.'), error: true);
+    }
+    if (mounted) setState(() => _savingPrompt = false);
+  }
+
+  Widget _heading(String title, String body) {
+    final p = Palette.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 22, 4, 10),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(title, style: TextStyle(fontFamily: kDisplayFont, fontSize: 20, fontWeight: FontWeight.w800, color: p.ink)),
+        const SizedBox(height: 4),
+        Text(body, style: TextStyle(fontSize: 13, color: p.muted, height: 1.35)),
+      ]),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     super.build(context);
     final p = Palette.of(context);
-    final c = _cfg;
-    if (c == null) return const Center(child: Spinner());
-    final hasKey = c['has_key'] == true;
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        Reveal(
-          child: Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(color: p.card, borderRadius: BorderRadius.circular(20)),
-            child: Row(children: [
-              const FinnAvatar(size: 48),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('Finn', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: p.ink)),
-                  Text(hasKey ? 'API key set (${c['key_hint'] ?? ''})' : tr('No API key. Finn will say he is busy.'), style: TextStyle(fontSize: 13.5, color: hasKey ? p.muted : p.danger)),
-                ]),
+    if (!_loaded) return const Center(child: Spinner());
+    if (_failed) {
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text(tr('Could not load Finn settings.'), style: TextStyle(color: p.muted)),
+          const SizedBox(height: 12),
+          SizedBox(width: 180, child: PillButton(label: tr('Try again'), secondary: true, onTap: () {
+            setState(() => _loaded = false);
+            _load();
+          })),
+        ]),
+      );
+    }
+    final ready = _keys.isNotEmpty && _models.isNotEmpty;
+    return RefreshIndicator(
+      color: p.ink,
+      onRefresh: _load,
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 40),
+        children: [
+          Reveal(
+            child: Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(color: p.card, borderRadius: BorderRadius.circular(20)),
+              child: Row(children: [
+                const FinnAvatar(size: 48),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('Finn', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: p.ink)),
+                    Text(
+                      ready
+                          ? tr('{keys} keys, {models} models in the fallback chain', {'keys': _keys.length, 'models': _models.length})
+                          : tr('No API key. Finn will say he is busy.'),
+                      style: TextStyle(fontSize: 13.5, color: ready ? p.muted : p.danger),
+                    ),
+                  ]),
+                ),
+              ]),
+            ),
+          ),
+          _heading(tr('API keys'), tr('Finn uses the first key. If it is rejected or out of quota, he moves to the next one.')),
+          for (var i = 0; i < _keys.length; i++)
+            Reveal(
+              key: ValueKey(_keys[i]['id']),
+              delay: Duration(milliseconds: 40 * i),
+              child: _KeyCard(
+                data: _keys[i],
+                index: i,
+                first: i == 0,
+                last: i == _keys.length - 1,
+                onEdit: () => _editKey(_keys[i]),
+                onRemove: () => _removeKey(_keys[i]),
+                onUp: () => _moveKey(i, -1),
+                onDown: () => _moveKey(i, 1),
               ),
+            ),
+          const SizedBox(height: 4),
+          PillButton(label: tr('Add a key'), icon: Icons.add_rounded, secondary: true, onTap: () => _editKey()),
+          _heading(tr('Model fallback'), tr('For every key, Finn tries these models top to bottom until one answers.')),
+          Container(
+            decoration: BoxDecoration(color: p.card, borderRadius: BorderRadius.circular(20)),
+            child: Column(children: [
+              for (var i = 0; i < _models.length; i++) ...[
+                if (i > 0) Divider(height: 0.5, thickness: 0.5, indent: 52, color: p.line),
+                Padding(
+                  key: ValueKey('m${_models[i]}'),
+                  padding: const EdgeInsets.fromLTRB(14, 6, 6, 6),
+                  child: Row(children: [
+                    Container(
+                      width: 26,
+                      height: 26,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(color: i == 0 ? p.ink : p.soft, shape: BoxShape.circle),
+                      child: Text('${i + 1}', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: i == 0 ? p.paper : p.ink)),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text(_models[i], style: TextStyle(fontSize: 14.5, color: p.ink, fontFamily: kMonoFont))),
+                    _SmallIcon(icon: Icons.keyboard_arrow_up_rounded, onTap: i == 0 ? null : () => _moveModel(i, -1)),
+                    _SmallIcon(icon: Icons.keyboard_arrow_down_rounded, onTap: i == _models.length - 1 ? null : () => _moveModel(i, 1)),
+                    _SmallIcon(
+                      icon: Icons.close_rounded,
+                      onTap: () => setState(() {
+                        _models = [..._models]..removeAt(i);
+                        _modelsDirty = true;
+                      }),
+                    ),
+                  ]),
+                ),
+              ],
             ]),
           ),
-        ),
-        const SizedBox(height: 14),
-        Stagger(start: const Duration(milliseconds: 60), children: [
-          FishiField(controller: _key, label: hasKey ? tr('Replace API key') : tr('API key'), obscure: true),
           const SizedBox(height: 10),
-          FishiField(controller: _endpoint, label: tr('Endpoint'), keyboardType: TextInputType.url),
-          const SizedBox(height: 10),
-          FishiField(controller: _model, label: tr('Model')),
-          const SizedBox(height: 10),
-          FishiField(controller: _audio, label: tr('Audio model')),
-          const SizedBox(height: 10),
-          FishiField(controller: _prompt, label: tr('Extra system prompt'), maxLines: 8),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(6, 8, 6, 16),
-            child: Text(tr('People never see these settings. Changes apply to the next Finn reply.'), style: TextStyle(fontSize: 13, color: p.muted)),
+          Row(children: [
+            Expanded(child: FishiField(controller: _newModel, label: tr('Add a model'), onSubmitted: (_) => _addModel())),
+            const SizedBox(width: 8),
+            CircleIcon(icon: Icons.add_rounded, size: 46, filled: true, onTap: _addModel),
+          ]),
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: () => setState(() {
+                _models = [..._defaultModels];
+                _modelsDirty = true;
+              }),
+              child: Text(tr('Use Gemini 3.8 to 3.5'), style: TextStyle(color: p.ink, fontWeight: FontWeight.w600)),
+            ),
           ),
-          PillButton(label: tr('Save Finn settings'), busy: _busy, onTap: _save),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 300),
+            curve: kSmooth,
+            child: _modelsDirty
+                ? Padding(padding: const EdgeInsets.only(top: 4), child: PillButton(label: tr('Save model order'), busy: _savingModels, onTap: _saveModels))
+                : const SizedBox(width: double.infinity),
+          ),
+          _heading(tr('Extra system prompt'), tr('People never see these settings. Changes apply to the next Finn reply.')),
+          FishiField(controller: _prompt, label: tr('Extra system prompt'), maxLines: 8),
+          const SizedBox(height: 12),
+          PillButton(label: tr('Save prompt'), busy: _savingPrompt, onTap: _savePrompt),
+        ],
+      ),
+    );
+  }
+}
+
+class _SmallIcon extends StatelessWidget {
+  const _SmallIcon({required this.icon, this.onTap});
+  final IconData icon;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = Palette.of(context);
+    return Tappable(
+      scale: 0.8,
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.all(7),
+        child: Icon(icon, size: 22, color: onTap == null ? p.line : p.ink),
+      ),
+    );
+  }
+}
+
+class _KeyCard extends StatelessWidget {
+  const _KeyCard({
+    required this.data,
+    required this.index,
+    required this.first,
+    required this.last,
+    required this.onEdit,
+    required this.onRemove,
+    required this.onUp,
+    required this.onDown,
+  });
+
+  final Map<String, dynamic> data;
+  final int index;
+  final bool first;
+  final bool last;
+  final VoidCallback onEdit;
+  final VoidCallback onRemove;
+  final VoidCallback onUp;
+  final VoidCallback onDown;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = Palette.of(context);
+    final endpoint = data['endpoint'] as String? ?? '';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.fromLTRB(14, 12, 6, 12),
+      decoration: BoxDecoration(
+        color: p.card,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: first ? p.ink : Colors.transparent, width: 1.5),
+      ),
+      child: Row(children: [
+        Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(color: first ? p.ink : p.soft, borderRadius: BorderRadius.circular(11)),
+          child: Icon(Icons.key_rounded, size: 19, color: first ? p.paper : p.ink),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(data['label'] as String? ?? '', style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w700, color: p.ink)),
+            const SizedBox(height: 2),
+            Text('${_providerName(endpoint)}  ·  ${data['hint'] ?? ''}', style: TextStyle(fontSize: 12.5, color: p.muted, fontFamily: kMonoFont)),
+            if (first)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(tr('Used first'), style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: p.ink)),
+              ),
+          ]),
+        ),
+        _SmallIcon(icon: Icons.keyboard_arrow_up_rounded, onTap: first ? null : onUp),
+        _SmallIcon(icon: Icons.keyboard_arrow_down_rounded, onTap: last ? null : onDown),
+        _SmallIcon(icon: Icons.edit_outlined, onTap: onEdit),
+        _SmallIcon(icon: Icons.delete_outline_rounded, onTap: onRemove),
+      ]),
+    );
+  }
+}
+
+class _KeySheet extends StatefulWidget {
+  const _KeySheet({this.existing});
+  final Map<String, dynamic>? existing;
+
+  @override
+  State<_KeySheet> createState() => _KeySheetState();
+}
+
+class _KeySheetState extends State<_KeySheet> {
+  late final _label = TextEditingController(text: widget.existing?['label'] as String? ?? '');
+  late final _endpoint = TextEditingController(text: widget.existing?['endpoint'] as String? ?? _googleEndpoint);
+  final _key = TextEditingController();
+  bool _busy = false;
+
+  bool get _editing => widget.existing != null;
+
+  @override
+  void dispose() {
+    _label.dispose();
+    _endpoint.dispose();
+    _key.dispose();
+    super.dispose();
+  }
+
+  void _preset(String endpoint, String label) {
+    HapticFeedback.selectionClick();
+    setState(() {
+      _endpoint.text = endpoint;
+      if (_label.text.trim().isEmpty || _label.text == 'Google AI' || _label.text == 'OpenRouter') _label.text = label;
+    });
+  }
+
+  Future<void> _save() async {
+    if (!_editing && (_key.text.trim().isEmpty || _endpoint.text.trim().isEmpty)) {
+      showToast(context, tr('Paste the key first.'), error: true);
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await supa.rpc('admin_save_finn_key', params: {
+        'key_id': widget.existing?['id'],
+        'key_label': _label.text.trim(),
+        'key_endpoint': _endpoint.text.trim(),
+        'key_value': _key.text.trim().isEmpty ? null : _key.text.trim(),
+      });
+      if (mounted) Navigator.of(context).pop(true);
+    } catch (_) {
+      if (mounted) {
+        setState(() => _busy = false);
+        showToast(context, tr('Could not save.'), error: true);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = Palette.of(context);
+    Widget chip(String label, String endpoint) {
+      final on = _endpoint.text.trim() == endpoint;
+      return Expanded(
+        child: Tappable(
+          scale: 0.95,
+          onTap: () => _preset(endpoint, label),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 260),
+            curve: kSmooth,
+            height: 42,
+            margin: const EdgeInsets.only(right: 8),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(color: on ? p.ink : p.soft, borderRadius: BorderRadius.circular(14)),
+            child: Text(label, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: on ? p.paper : p.ink)),
+          ),
+        ),
+      );
+    }
+
+    return BottomSheetFrame(
+      child: SingleChildScrollView(
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text(_editing ? tr('Edit key') : tr('Add a key'), style: TextStyle(fontFamily: kDisplayFont, fontSize: 22, fontWeight: FontWeight.w800, color: p.ink)),
+          const SizedBox(height: 14),
+          Row(children: [chip('Google AI', _googleEndpoint), chip('OpenRouter', _openRouterEndpoint)]),
+          const SizedBox(height: 12),
+          FishiField(controller: _label, label: tr('Name'), maxLength: 40),
+          const SizedBox(height: 10),
+          FishiField(controller: _endpoint, label: tr('Endpoint'), keyboardType: TextInputType.url, onChanged: (_) => setState(() {})),
+          const SizedBox(height: 10),
+          FishiField(controller: _key, label: _editing ? tr('New key (leave empty to keep)') : tr('API key'), obscure: true),
+          const SizedBox(height: 18),
+          PillButton(label: tr('Save'), busy: _busy, onTap: _save),
         ]),
-      ],
+      ),
     );
   }
 }
