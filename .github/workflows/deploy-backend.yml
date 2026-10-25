@@ -18,16 +18,47 @@ jobs:
     env:
       PROJECT_REF: rlupbwqnpesdtkhuhpsr
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Check database secret
+        if: ${{ inputs.migration != '' }}
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          test -n "$DB_URL" || { echo "::error::The SUPABASE_DB_URL secret is empty or missing."; exit 1; }
+          case "$DB_URL" in
+            *YOUR-PASSWORD*) echo "::error::SUPABASE_DB_URL still contains [YOUR-PASSWORD]. Replace it, brackets included, with your database password."; exit 1 ;;
+            postgres://*|postgresql://*) ;;
+            *) echo "::error::SUPABASE_DB_URL must start with postgresql://"; exit 1 ;;
+          esac
+          host=$(printf '%s' "$DB_URL" | sed -E 's#^[a-z]+://[^@]*@([^:/?]+).*#\1#')
+          echo "Database host: $host"
+          case "$host" in
+            db.*.supabase.co) echo "::error::This is the Direct connection string. GitHub cannot reach it. Use the Session pooler string (host ends in pooler.supabase.com)."; exit 1 ;;
+          esac
+          auth=$(printf '%s' "$DB_URL" | sed -E 's#^[a-z]+://([^@]*)@.*#\1#')
+          pass=${auth#*:}
+          case "$pass" in
+            *[\#/?\ ]*) echo "::error::The password contains # / ? or a space. Replace them: # -> %23, / -> %2F, ? -> %3F, space -> %20."; exit 1 ;;
+          esac
 
       - name: Run migration
         if: ${{ inputs.migration != '' }}
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          test -n "$DB_URL" || { echo "Add the SUPABASE_DB_URL secret first"; exit 1; }
           sudo apt-get install -y -q postgresql-client > /dev/null
+          if ! psql "$DB_URL" -v ON_ERROR_STOP=1 -c "select 1" > /dev/null 2> err.txt; then
+            sed -E 's#://[^@]*@#://***@#g' err.txt
+            if grep -qi "password authentication failed" err.txt; then
+              echo "::error::Wrong database password. Reset it in Supabase (Project Settings, Database) and update the secret."
+            else
+              echo "::error::Could not connect to the database. Check the SUPABASE_DB_URL secret (Session pooler string, port 5432)."
+            fi
+            exit 1
+          fi
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f "supabase/migrations/${{ inputs.migration }}"
+          echo "Migration applied."
 
       - uses: supabase/setup-cli@v1
         if: ${{ inputs.functions != '' }}
