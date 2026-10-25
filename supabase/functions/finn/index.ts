@@ -29,24 +29,33 @@ async function signed(path: string) {
   return data?.signedUrl
 }
 
+const MIME: Record<string, string> = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', heic: 'image/heic',
+}
+
+async function base64Of(path: string) {
+  const { data } = await service.storage.from('media').download(path)
+  if (!data) return null
+  const bytes = new Uint8Array(await data.arrayBuffer())
+  let bin = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return btoa(bin)
+}
+
 async function mediaPart(m: Row) {
   if (!m?.media_path) return null
+  const ext = (m.media_path.split('.').pop() ?? '').toLowerCase()
   if (m.kind === 'image') {
-    const url = await signed(m.media_path)
-    return url ? { type: 'image_url', image_url: { url } } : null
+    const b64 = await base64Of(m.media_path)
+    return b64 ? { type: 'image_url', image_url: { url: `data:${MIME[ext] ?? 'image/jpeg'};base64,${b64}` } } : null
   }
   if (m.kind === 'video') {
     const url = await signed(m.media_path)
     return url ? { type: 'video_url', video_url: { url } } : null
   }
   if (m.kind === 'audio') {
-    const { data } = await service.storage.from('media').download(m.media_path)
-    if (!data) return null
-    const bytes = new Uint8Array(await data.arrayBuffer())
-    let bin = ''
-    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
-    const format = (m.media_path.split('.').pop() ?? 'm4a').toLowerCase()
-    return { type: 'input_audio', input_audio: { data: btoa(bin), format } }
+    const b64 = await base64Of(m.media_path)
+    return b64 ? { type: 'input_audio', input_audio: { data: b64, format: ext || 'm4a' } } : null
   }
   return null
 }
